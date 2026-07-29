@@ -1,8 +1,12 @@
 use std::{
     fs::File,
-    io::{Error, Read, Result, Write},
+    io::{Error, ErrorKind, Read, Result, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::sleep,
     time::Duration,
 };
@@ -53,7 +57,8 @@ fn read_acmi_file(filepath: &Path) -> Result<FixedVec<FixedString>> {
 /// Create and configure the server socket.
 fn create_server_socket(host: &str, port: u16) -> Result<TcpListener> {
     let listener = TcpListener::bind((host, port))?;
-    // TODO: Do we need `listen` or `timeout`?
+    listener.set_nonblocking(true)?;
+
     if let Ok(addr) = listener.local_addr() {
         println!("Server listening on {addr}");
     }
@@ -62,13 +67,14 @@ fn create_server_socket(host: &str, port: u16) -> Result<TcpListener> {
 }
 
 /// Perform the Tacview handshake with the client.
-fn perform_handshake(stream: &mut TcpStream) -> Result<()> {
+fn perform_handshake(stream: &mut TcpStream, host_username: &str) -> Result<()> {
     let timeout = Some(Duration::from_secs(5));
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
 
-    let handshake = b"XtraLib.Stream.0\nTacview.RealTimeTelemetry.0\nHost streamtest\n\0";
-    stream.write_all(handshake)?;
+    let handshake =
+        format!("XtraLib.Stream.0\nTacview.RealTimeTelemetry.0\nHost {host_username}\n\0");
+    stream.write_all(handshake.as_bytes())?;
 
     // Wait for client to send handshake
     let sleep_dur = Duration::from_millis(100);
@@ -111,6 +117,7 @@ fn stream_acmi_data<'a, T>(
     acmi_data: T,
     time_multiplier: f32,
     start_time: f32,
+    continue_loops: &Arc<AtomicBool>,
 ) -> Result<()>
 where
     T: IntoIterator<Item = &'a FixedString>,
@@ -136,6 +143,10 @@ where
     }
 
     for line in acmi_data {
+        if continue_loops.load(Ordering::Acquire) {
+            break;
+        }
+
         buffer.push_str(line);
         buffer.push('\n');
 
@@ -148,7 +159,14 @@ where
                 println!("Started streaming from time {cur_time:.2}s")
             }
 
-            stream.write_all(last_buffer.as_bytes())?;
+            let send_res = stream.write_all(last_buffer.as_bytes());
+
+            if let Err(err) = send_res {
+                return Err(Error::new(
+                    err.kind(),
+                    "Transmission stopped because the connection was closed.",
+                ));
+            }
 
             // Only sleep if we're not seeking and not the first frame after seek
             if last_buffer_time > 0. && !first_frame_after_seek && !seeking {
@@ -174,32 +192,49 @@ fn run_server(
     host: &str,
     port: u16,
     start_time: f32,
+    continue_loops: &Arc<AtomicBool>,
 ) -> Result<()> {
     let acmi_data = read_acmi_file(filepath)?;
 
+    let mut host_username = "Tacview Realtime Recorder".to_owned();
+
+    if let Some(filename) = filepath.file_name().and_then(|name| name.to_str()) {
+        host_username += ": ";
+        host_username += filename;
+    }
+
     let server_socket = create_server_socket(host, port)?;
 
-    for stream in server_socket.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                println!("Client connected from {}", stream.peer_addr()?);
+    let blocking_duration = Duration::from_millis(100);
 
-                let handshake_res = perform_handshake(&mut stream);
+    while continue_loops.load(Ordering::Acquire) {
+        let stream = server_socket.accept();
+        match stream {
+            Ok((mut stream, addr)) => {
+                println!("Client connected from {}", addr);
+
+                let handshake_res = perform_handshake(&mut stream, &host_username);
                 if let Err(err) = handshake_res {
-                    eprintln!("Handshake failed, closing connection: {err}");
+                    eprintln!("Handshake failed: {err}");
                     continue;
                 }
 
                 println!("Streaming ACM data...");
-                let stream_res =
-                    stream_acmi_data(&mut stream, acmi_data.iter(), time_multiplier, start_time);
+                let stream_res = stream_acmi_data(
+                    &mut stream,
+                    acmi_data.iter(),
+                    time_multiplier,
+                    start_time,
+                    continue_loops,
+                );
                 if let Err(err) = stream_res {
-                    eprintln!("Streaming failed, closing connection: {err}");
+                    eprintln!("Stream ended early: {err}");
                 } else {
                     println!("Stream complete");
                 }
             }
-            Err(err) => println!("Encountered error: {err}"),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => sleep(blocking_duration),
+            Err(err) => eprintln!("Listener was closed: {err}"),
         }
     }
 
@@ -207,19 +242,25 @@ fn run_server(
 }
 
 /// Main entry point with command line argument parsing.
-fn main() {
+fn main() -> Result<()> {
     let args = Args::parse();
-    let run_res = run_server(
+
+    let continue_loops = Arc::new(AtomicBool::new(true));
+
+    let r = continue_loops.clone();
+
+    let _ = ctrlc::set_handler(move || r.store(false, Ordering::Release));
+
+    run_server(
         &args.filename,
         args.time_multiplier,
         &args.host,
         args.port,
         args.start_time,
-    );
+        &continue_loops,
+    )?;
 
-    if let Err(err) = run_res {
-        eprintln!("Couldn't run server: {err}");
-    }
+    Ok(())
 }
 
 /// Stream ACMI file data via Tacview Real Time Telemetry
@@ -228,16 +269,16 @@ fn main() {
 struct Args {
     /// Path to the ACMI file (.acmi, .txt, or .zip.acmi)
     filename: PathBuf,
-    /// Time multiplier for playback speed (default: 32)
+    /// Time multiplier for playback speed
     #[arg(short, long = "timemultiplier", default_value_t = 32.)]
     time_multiplier: f32,
-    /// Start time offset in seconds from the beginning of the file (default: 0)
+    /// Start time offset in seconds from the beginning of the file
     #[arg(short, long = "start-time", default_value_t = 0.)]
     start_time: f32,
-    /// Host to bind to (default: localhost)
-    #[arg(long, default_value_t = "localhost".to_string())]
+    /// Host to bind to
+    #[arg(long, default_value_t = "localhost".to_owned())]
     host: String,
-    /// Port to bind to (default: 42674)
+    /// Port to bind to
     #[arg(short, long, default_value_t = 42674)]
     port: u16,
 }
