@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use clap::{Parser, builder::Str};
+use clap::Parser;
 use zip::ZipArchive;
 
 type FixedString = Box<str>;
@@ -137,6 +137,7 @@ where
 
     for line in acmi_data {
         buffer.push_str(line);
+        buffer.push('\n');
 
         if let Some(line) = line.strip_prefix('#')
             && let Ok(cur_time) = line.parse::<f32>()
