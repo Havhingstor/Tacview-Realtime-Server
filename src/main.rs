@@ -30,8 +30,18 @@ fn read_acmi_file(filepath: &Path) -> Result<FixedVec<FixedString>> {
     if name.ends_with(".zip.acmi") {
         let file = File::open(filepath)?;
         let mut archive = ZipArchive::new(file)?;
-        let mut file = archive.by_name("acmi.txt")?;
-        read_file_to_lines(&mut file)
+        let file_name = archive
+            .file_names()
+            .filter(|name| name.ends_with(".acmi") || name.ends_with(".txt"))
+            .map(|name| name.to_owned())
+            .next();
+
+        if let Some(file_name) = file_name {
+            let mut file = archive.by_name(&file_name)?;
+            read_file_to_lines(&mut file)
+        } else {
+            Err(Error::other("Couldn't find .acmi or .txt file in archive!"))
+        }
     } else if name.ends_with(".acmi") || name.ends_with(".txt") {
         let mut file = File::open(filepath)?;
         read_file_to_lines(&mut file)
