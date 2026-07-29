@@ -220,7 +220,7 @@ fn run_server(
 
                 let handshake_res = perform_handshake(&mut stream, &host_username);
                 if let Err(err) = handshake_res {
-                    eprintln!("Handshake failed: {err}, {}", err.kind());
+                    eprintln!("Handshake failed: {err}");
                     continue;
                 }
 
@@ -233,13 +233,13 @@ fn run_server(
                     continue_loops,
                 );
                 if let Err(err) = stream_res {
-                    eprintln!("Stream ended early: {err}, {}", err.kind());
+                    eprintln!("Stream ended early: {err}");
                 } else {
                     println!("Stream complete");
                 }
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => sleep(blocking_duration),
-            Err(err) => eprintln!("Listener was closed: {err}, {}", err.kind()),
+            Err(err) => eprintln!("Listener was closed: {err}"),
         }
     }
     eprintln!("Shutting down server");
