@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use clap::Parser;
+use clap::{Parser, builder::Str};
 use zip::ZipArchive;
 
 type FixedString = Box<str>;
@@ -76,7 +76,15 @@ fn perform_handshake(stream: &mut TcpStream) -> Result<()> {
 
     // Read the client handshake
     let mut received = String::new();
-    stream.read_to_string(&mut received)?;
+    let mut last_read = 1024;
+    while last_read == 1024 {
+        let mut buf = [0; 1024];
+        last_read = stream.read(&mut buf)?;
+        let next_str = str::from_utf8(&buf[..last_read]).map_err(|err| {
+            Error::other(format!("Error while converting handshake to UTF-8: {err}"))
+        });
+        received.push_str(next_str?);
+    }
 
     // Check if the client handshake is valid
     println!("Client handshake: {received}");
