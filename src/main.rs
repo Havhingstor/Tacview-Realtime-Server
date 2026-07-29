@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
@@ -138,6 +138,7 @@ where
 
     let mut buffer = String::new();
     let mut buf_start_time = 0f32;
+    let mut buf_start_realtime = Instant::now();
 
     // Find the first timestamp in the file to use as baseline
     let first_timestamp = find_first_timestamp(acmi_data.clone());
@@ -170,12 +171,16 @@ where
             // Only sleep if we're not seeking
             if buf_start_time > 0. && !seeking {
                 let sleep_secs = (next_buf_time - buf_start_time) / time_multiplier;
-                let sleep_dur = Duration::from_secs_f64(sleep_secs as f64);
+                let already_slept = Instant::now() - buf_start_realtime;
+                println!("Already slept: {already_slept:?}");
+                let sleep_dur =
+                    Duration::from_secs_f64(sleep_secs as f64).saturating_sub(already_slept);
                 sleep(sleep_dur);
             }
 
             buffer.clear();
             buf_start_time = next_buf_time;
+            buf_start_realtime = Instant::now();
         }
 
         buffer.push_str(line);
