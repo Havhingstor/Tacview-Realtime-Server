@@ -238,7 +238,7 @@ fn run_server(
             Err(err) => eprintln!("Listener was closed: {err}, {}", err.kind()),
         }
     }
-    eprintln!("Breaking out of stream because of Ctrl-C");
+    eprintln!("Shutting down server");
 
     Ok(())
 }
