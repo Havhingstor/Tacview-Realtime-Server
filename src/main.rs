@@ -182,7 +182,11 @@ where
         buffer.push('\n');
     }
 
-    send_buf(stream, &buffer)
+    if !buffer.is_empty() {
+        send_buf(stream, &buffer)?;
+    }
+
+    Ok(())
 }
 
 /// Main server loop that accepts connections and streams ACMI data.
