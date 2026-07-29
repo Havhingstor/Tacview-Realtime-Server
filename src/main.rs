@@ -111,6 +111,17 @@ fn find_first_timestamp<'a>(acmi_data: impl IntoIterator<Item = &'a FixedString>
         .unwrap_or_default()
 }
 
+fn send_buf(stream: &mut TcpStream, buffer: &String) -> Result<()> {
+    stream.write_all(buffer.as_bytes()).map_err(|err| {
+        Error::new(
+            err.kind(),
+            "Transmission stopped because the connection was closed.",
+        )
+    })?;
+
+    Ok(())
+}
+
 /// Stream ACMI data to the connected client.
 fn stream_acmi_data<'a, T>(
     stream: &mut TcpStream,
@@ -126,14 +137,12 @@ where
     let acmi_data = acmi_data.into_iter();
 
     let mut buffer = String::new();
-    let mut last_buffer = String::new();
-    let mut last_buffer_time = 0f32;
+    let mut buf_start_time = 0f32;
 
     // Find the first timestamp in the file to use as baseline
     let first_timestamp = find_first_timestamp(acmi_data.clone());
     let target_start_time = first_timestamp + start_time;
     let mut seeking = start_time > 0.;
-    let mut first_frame_after_seek = true;
 
     if seeking {
         println!(
@@ -143,46 +152,37 @@ where
     }
 
     for line in acmi_data {
-        if continue_loops.load(Ordering::Acquire) {
+        if !continue_loops.load(Ordering::Acquire) {
+            eprintln!("Breaking out of stream because of Ctrl-C");
             break;
         }
 
-        buffer.push_str(line);
-        buffer.push('\n');
-
         if let Some(line) = line.strip_prefix('#')
-            && let Ok(cur_time) = line.parse::<f32>()
+            && let Ok(next_buf_time) = line.parse::<f32>()
         {
-            if seeking && cur_time >= target_start_time {
+            send_buf(stream, &buffer)?;
+
+            if seeking && buf_start_time >= target_start_time {
                 seeking = false;
-                first_frame_after_seek = true;
-                println!("Started streaming from time {cur_time:.2}s")
+                println!("Started streaming from time {buf_start_time:.2}s")
             }
 
-            let send_res = stream.write_all(last_buffer.as_bytes());
-
-            if let Err(err) = send_res {
-                return Err(Error::new(
-                    err.kind(),
-                    "Transmission stopped because the connection was closed.",
-                ));
-            }
-
-            // Only sleep if we're not seeking and not the first frame after seek
-            if last_buffer_time > 0. && !first_frame_after_seek && !seeking {
-                let sleep_secs = (cur_time - last_buffer_time) / time_multiplier;
+            // Only sleep if we're not seeking
+            if buf_start_time > 0. && !seeking {
+                let sleep_secs = (next_buf_time - buf_start_time) / time_multiplier;
                 let sleep_dur = Duration::from_secs_f64(sleep_secs as f64);
                 sleep(sleep_dur);
             }
 
-            last_buffer = buffer;
-            last_buffer_time = cur_time;
-            buffer = String::new();
-            first_frame_after_seek = false;
+            buffer.clear();
+            buf_start_time = next_buf_time;
         }
+
+        buffer.push_str(line);
+        buffer.push('\n');
     }
 
-    Ok(())
+    send_buf(stream, &buffer)
 }
 
 /// Main server loop that accepts connections and streams ACMI data.
@@ -211,11 +211,12 @@ fn run_server(
         let stream = server_socket.accept();
         match stream {
             Ok((mut stream, addr)) => {
+                stream.set_nonblocking(false)?;
                 println!("Client connected from {}", addr);
 
                 let handshake_res = perform_handshake(&mut stream, &host_username);
                 if let Err(err) = handshake_res {
-                    eprintln!("Handshake failed: {err}");
+                    eprintln!("Handshake failed: {err}, {}", err.kind());
                     continue;
                 }
 
@@ -228,15 +229,16 @@ fn run_server(
                     continue_loops,
                 );
                 if let Err(err) = stream_res {
-                    eprintln!("Stream ended early: {err}");
+                    eprintln!("Stream ended early: {err}, {}", err.kind());
                 } else {
                     println!("Stream complete");
                 }
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => sleep(blocking_duration),
-            Err(err) => eprintln!("Listener was closed: {err}"),
+            Err(err) => eprintln!("Listener was closed: {err}, {}", err.kind()),
         }
     }
+    eprintln!("Breaking out of stream because of Ctrl-C");
 
     Ok(())
 }
