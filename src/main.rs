@@ -103,45 +103,64 @@ fn perform_handshake(stream: &mut TcpStream, host_username: &str) -> Result<()> 
 }
 
 /// Find the first timestamp in the ACMI data
-fn find_first_timestamp<'a>(acmi_data: impl IntoIterator<Item = &'a FixedString>) -> f32 {
+fn find_first_timestamp(acmi_data: &[FixedString]) -> f32 {
     acmi_data
-        .into_iter()
+        .iter()
         .filter_map(|line| line.strip_prefix('#').and_then(|line| line.parse().ok()))
         .next()
         .unwrap_or_default()
 }
 
-fn send_buf(stream: &mut TcpStream, buffer: &String) -> Result<()> {
-    stream.write_all(buffer.as_bytes()).map_err(|err| {
-        Error::new(
-            err.kind(),
-            "Transmission stopped because the connection was closed.",
-        )
-    })?;
+fn send_block(stream: &mut TcpStream, lines: &[FixedString]) -> Result<()> {
+    for line in lines {
+        stream.write_all(line.as_bytes()).map_err(|err| {
+            Error::new(
+                err.kind(),
+                "Transmission stopped because the connection was closed.",
+            )
+        })?;
+
+        stream.write_all(b"\n")?;
+    }
 
     Ok(())
 }
 
+/// Sleep the correct amount of time before sending a block. Doesn't sleep if we're seeking
+/// currently.
+fn sleep_before_send(
+    last_to_current_delta: f32,
+    actual_wait_start: Instant,
+    seeking: &bool,
+    time_multiplier: &f32,
+) {
+    // Only sleep if we're not seeking and it's necessary
+    if !seeking && last_to_current_delta > 0. {
+        let sleep_secs = last_to_current_delta / time_multiplier;
+        let already_slept = Instant::now() - actual_wait_start;
+        let sleep_dur = Duration::from_secs_f64(sleep_secs as f64).saturating_sub(already_slept);
+        sleep(sleep_dur);
+    }
+}
+
 /// Stream ACMI data to the connected client.
-fn stream_acmi_data<'a, T>(
+fn stream_acmi_data(
     stream: &mut TcpStream,
-    acmi_data: T,
+    acmi_data: &[FixedString],
     time_multiplier: f32,
     start_time: f32,
     continue_loops: &Arc<AtomicBool>,
-) -> Result<()>
-where
-    T: IntoIterator<Item = &'a FixedString>,
-    T::IntoIter: Clone,
-{
-    let acmi_data = acmi_data.into_iter();
-
-    let mut buffer = String::new();
-    let mut buf_start_time = 0f32;
-    let mut buf_start_realtime = Instant::now();
-
+) -> Result<()> {
     // Find the first timestamp in the file to use as baseline
-    let first_timestamp = find_first_timestamp(acmi_data.clone());
+    let first_timestamp = find_first_timestamp(acmi_data);
+    // We strategically use this as the start time for the first two blocks.
+    // This way we don't wait ridiculous amounts
+    let mut current_block = first_timestamp;
+
+    let mut start_of_block = 0;
+    let mut last_to_current_delta = 0f32;
+    let mut actual_wait_start = Instant::now();
+
     let target_start_time = first_timestamp + start_time;
     let mut seeking = start_time > 0.;
 
@@ -152,44 +171,49 @@ where
         );
     }
 
-    for line in acmi_data {
+    for (idx, line) in acmi_data.iter().enumerate() {
         if !continue_loops.load(Ordering::Acquire) {
             eprintln!("Breaking out of stream because of Ctrl-C");
             break;
         }
 
         if let Some(line) = line.strip_prefix('#')
-            && let Ok(next_buf_time) = line.parse::<f32>()
+            && let Ok(next_block) = line.parse::<f32>()
         {
-            send_buf(stream, &buffer)?;
+            sleep_before_send(
+                last_to_current_delta,
+                actual_wait_start,
+                &seeking,
+                &time_multiplier,
+            );
 
-            if seeking && buf_start_time >= target_start_time {
+            send_block(stream, &acmi_data[start_of_block..idx])?;
+            actual_wait_start = Instant::now();
+
+            // If we have reached the desired start point, the next block can be sent after waiting
+            if seeking && current_block >= target_start_time {
                 seeking = false;
-                println!("Started streaming from time {buf_start_time:.2}s")
+                println!("Started streaming from time {current_block:.2}s")
             }
 
-            // Only sleep if we're not seeking
-            if buf_start_time > 0. && !seeking {
-                let sleep_secs = (next_buf_time - buf_start_time) / time_multiplier;
-                let already_slept = Instant::now() - buf_start_realtime;
-                println!("Already slept: {already_slept:?}");
-                let sleep_dur =
-                    Duration::from_secs_f64(sleep_secs as f64).saturating_sub(already_slept);
-                sleep(sleep_dur);
-            }
+            let current_to_next_delta = next_block - current_block;
 
-            buffer.clear();
-            buf_start_time = next_buf_time;
-            buf_start_realtime = Instant::now();
+            // Switch around for upcoming block
+
+            current_block = next_block;
+            last_to_current_delta = current_to_next_delta;
+            start_of_block = idx;
         }
-
-        buffer.push_str(line);
-        buffer.push('\n');
     }
 
-    if !buffer.is_empty() {
-        send_buf(stream, &buffer)?;
-    }
+    sleep_before_send(
+        last_to_current_delta,
+        actual_wait_start,
+        &seeking,
+        &time_multiplier,
+    );
+
+    send_block(stream, &acmi_data[start_of_block..])?;
 
     Ok(())
 }
@@ -232,7 +256,7 @@ fn run_server(
                 println!("Streaming ACM data...");
                 let stream_res = stream_acmi_data(
                     &mut stream,
-                    acmi_data.iter(),
+                    &acmi_data,
                     time_multiplier,
                     start_time,
                     continue_loops,
