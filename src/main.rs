@@ -3,11 +3,7 @@ use std::{
     io::{Error, ErrorKind, Read, Result, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::sleep,
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -54,20 +50,45 @@ fn read_acmi_file(filepath: &Path) -> Result<FixedVec<FixedString>> {
     }
 }
 
-/// Write all the bytes from the buffer into the destination, return if continue_loops is false
-fn write_all(buf: &[u8], dest: &mut impl Write, continue_loops: &Arc<AtomicBool>) -> Result<()> {
+/// Find the first timestamp in the ACMI data
+fn find_first_timestamp(acmi_data: &[FixedString]) -> f32 {
+    acmi_data
+        .iter()
+        .filter_map(|line| line.strip_prefix('#').and_then(|line| line.parse().ok()))
+        .next()
+        .unwrap_or_default()
+}
+
+fn can_cont(breaker: &Arc<(Mutex<bool>, Condvar)>) -> bool {
+    breaker.0.lock().is_ok_and(|guard| *guard)
+}
+
+fn wait(dur: Duration, breaker: &Arc<(Mutex<bool>, Condvar)>) {
+    if let Ok(guard) = breaker.0.lock() {
+        let _ = breaker
+            .1
+            .wait_timeout_while(guard, dur, |can_cont| *can_cont);
+    }
+}
+
+/// Write all the bytes from the buffer into the destination, return if breaker is false
+fn write_all(
+    buf: &[u8],
+    dest: &mut impl Write,
+    breaker: &Arc<(Mutex<bool>, Condvar)>,
+) -> Result<()> {
     let mut bytes_written = 0;
 
     let blocking_duration = Duration::from_millis(10);
 
     while bytes_written < buf.len() {
-        if !continue_loops.load(Ordering::Acquire) {
+        if !can_cont(breaker) {
             return Err(ErrorKind::Interrupted.into());
         }
         match dest.write(&buf[bytes_written..]) {
             Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
             Ok(n) => bytes_written += n,
-            Err(err) if err.kind() == ErrorKind::WouldBlock => sleep(blocking_duration),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => wait(blocking_duration, breaker),
             Err(err) => return Err(err),
         }
     }
@@ -75,17 +96,21 @@ fn write_all(buf: &[u8], dest: &mut impl Write, continue_loops: &Arc<AtomicBool>
     Ok(())
 }
 
-/// Read from the Read into the buffer, break if continue_loops is false
-fn read(buf: &mut [u8], source: &mut impl Read, continue_loops: &Arc<AtomicBool>) -> Result<usize> {
+/// Read from the Read into the buffer, break if breaker is false
+fn read(
+    buf: &mut [u8],
+    source: &mut impl Read,
+    breaker: &Arc<(Mutex<bool>, Condvar)>,
+) -> Result<usize> {
     let blocking_duration = Duration::from_millis(10);
 
     loop {
-        if !continue_loops.load(Ordering::Acquire) {
+        if !can_cont(breaker) {
             return Err(ErrorKind::Interrupted.into());
         }
         match source.read(buf) {
             Ok(n) => return Ok(n),
-            Err(err) if err.kind() == ErrorKind::WouldBlock => sleep(blocking_duration),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => wait(blocking_duration, breaker),
             Err(err) => return Err(err),
         }
     }
@@ -107,7 +132,7 @@ fn create_server_socket(host: &str, port: u16) -> Result<TcpListener> {
 fn perform_handshake(
     stream: &mut TcpStream,
     host_username: &str,
-    continue_loops: &Arc<AtomicBool>,
+    breaker: &Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<()> {
     let timeout = Some(Duration::from_secs(5));
     stream.set_read_timeout(timeout)?;
@@ -115,25 +140,22 @@ fn perform_handshake(
 
     let handshake =
         format!("XtraLib.Stream.0\nTacview.RealTimeTelemetry.0\nHost {host_username}\n\0");
-    write_all(handshake.as_bytes(), stream, continue_loops)?;
-    println!("Sent");
+    write_all(handshake.as_bytes(), stream, breaker)?;
 
     // Wait for client to send handshake
     let sleep_dur = Duration::from_millis(100);
-    sleep(sleep_dur);
-    println!("Slept");
+    wait(sleep_dur, breaker);
 
     // Read the client handshake
     let mut received = String::new();
     let mut last_read = 1024;
     while last_read == 1024 {
         let mut buf = [0; 1024];
-        last_read = read(&mut buf, stream, continue_loops)?;
+        last_read = read(&mut buf, stream, breaker)?;
         let next_str = str::from_utf8(&buf[..last_read]).map_err(|err| {
             Error::other(format!("Error while converting handshake to UTF-8: {err}"))
         });
         received.push_str(next_str?);
-        println!("read");
     }
 
     // Check if the client handshake is valid
@@ -146,22 +168,13 @@ fn perform_handshake(
     }
 }
 
-/// Find the first timestamp in the ACMI data
-fn find_first_timestamp(acmi_data: &[FixedString]) -> f32 {
-    acmi_data
-        .iter()
-        .filter_map(|line| line.strip_prefix('#').and_then(|line| line.parse().ok()))
-        .next()
-        .unwrap_or_default()
-}
-
 fn send_block(
     stream: &mut TcpStream,
     lines: &[FixedString],
-    continue_loops: &Arc<AtomicBool>,
+    breaker: &Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<()> {
     for line in lines {
-        write_all(line.as_bytes(), stream, continue_loops).map_err(|err| {
+        write_all(line.as_bytes(), stream, breaker).map_err(|err| {
             Error::new(
                 err.kind(),
                 "Transmission stopped because the connection was closed.",
@@ -181,13 +194,14 @@ fn sleep_before_send(
     actual_wait_start: Instant,
     seeking: &bool,
     time_multiplier: &f32,
+    breaker: &Arc<(Mutex<bool>, Condvar)>,
 ) {
     // Only sleep if we're not seeking and it's necessary
     if !seeking && last_to_current_delta > 0. {
         let sleep_secs = last_to_current_delta / time_multiplier;
         let already_slept = Instant::now() - actual_wait_start;
         let sleep_dur = Duration::from_secs_f64(sleep_secs as f64).saturating_sub(already_slept);
-        sleep(sleep_dur);
+        wait(sleep_dur, breaker);
     }
 }
 
@@ -197,7 +211,7 @@ fn stream_acmi_data(
     acmi_data: &[FixedString],
     time_multiplier: f32,
     start_time: f32,
-    continue_loops: &Arc<AtomicBool>,
+    breaker: &Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<()> {
     // Find the first timestamp in the file to use as baseline
     let first_timestamp = find_first_timestamp(acmi_data);
@@ -220,7 +234,7 @@ fn stream_acmi_data(
     }
 
     for (idx, line) in acmi_data.iter().enumerate() {
-        if !continue_loops.load(Ordering::Acquire) {
+        if !can_cont(breaker) {
             eprintln!("Breaking out of stream because of Ctrl-C");
             break;
         }
@@ -233,9 +247,10 @@ fn stream_acmi_data(
                 actual_wait_start,
                 &seeking,
                 &time_multiplier,
+                breaker,
             );
 
-            send_block(stream, &acmi_data[start_of_block..idx], continue_loops)?;
+            send_block(stream, &acmi_data[start_of_block..idx], breaker)?;
             actual_wait_start = Instant::now();
 
             // If we have reached the desired start point, the next block can be sent after waiting
@@ -259,9 +274,10 @@ fn stream_acmi_data(
         actual_wait_start,
         &seeking,
         &time_multiplier,
+        breaker,
     );
 
-    send_block(stream, &acmi_data[start_of_block..], continue_loops)?;
+    send_block(stream, &acmi_data[start_of_block..], breaker)?;
 
     Ok(())
 }
@@ -273,7 +289,7 @@ fn run_server(
     host: &str,
     port: u16,
     start_time: f32,
-    continue_loops: &Arc<AtomicBool>,
+    breaker: &Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<()> {
     let acmi_data = read_acmi_file(filepath)?;
 
@@ -288,13 +304,13 @@ fn run_server(
 
     let blocking_duration = Duration::from_millis(10);
 
-    while continue_loops.load(Ordering::Acquire) {
+    while can_cont(breaker) {
         let stream = server_socket.accept();
         match stream {
             Ok((mut stream, addr)) => {
                 println!("Client connected from {}", addr);
 
-                let handshake_res = perform_handshake(&mut stream, &host_username, continue_loops);
+                let handshake_res = perform_handshake(&mut stream, &host_username, breaker);
                 if let Err(err) = handshake_res {
                     eprintln!("Handshake failed: {err}");
                     continue;
@@ -306,7 +322,7 @@ fn run_server(
                     &acmi_data,
                     time_multiplier,
                     start_time,
-                    continue_loops,
+                    breaker,
                 );
                 if let Err(err) = stream_res {
                     eprintln!("Stream ended early: {err}");
@@ -314,7 +330,7 @@ fn run_server(
                     println!("Stream complete");
                 }
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => sleep(blocking_duration),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => wait(blocking_duration, breaker),
             Err(err) => eprintln!("Listener was closed: {err}"),
         }
     }
@@ -327,11 +343,16 @@ fn run_server(
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let continue_loops = Arc::new(AtomicBool::new(true));
+    let breaker = Arc::new((Mutex::new(true), Condvar::new()));
 
-    let r = continue_loops.clone();
+    let r = breaker.clone();
 
-    let _ = ctrlc::set_handler(move || r.store(false, Ordering::Release));
+    let _ = ctrlc::set_handler(move || {
+        if let Ok(mut guard) = r.0.lock() {
+            *guard = false;
+            r.1.notify_all();
+        }
+    });
 
     run_server(
         &args.filename,
@@ -339,7 +360,7 @@ fn main() -> Result<()> {
         &args.host,
         args.port,
         args.start_time,
-        &continue_loops,
+        &breaker,
     )?;
 
     Ok(())
