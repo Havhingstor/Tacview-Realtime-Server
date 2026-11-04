@@ -7,4 +7,4 @@ description = "Standalone package to read a .ACMI file and host a single client 
 [dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
 ctrlc = "3.5.2"
-zip = "8.6.0"
+zip = "9.0.5"
