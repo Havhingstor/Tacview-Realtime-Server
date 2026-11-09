@@ -1,8 +1,10 @@
 use std::{
+    borrow::Cow,
     fs::File,
     io::{Error, ErrorKind, Read, Result, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+    result,
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
@@ -32,9 +34,9 @@ fn read_acmi_file(filepath: &Path) -> Result<FixedVec<FixedString>> {
         let mut archive = ZipArchive::new(file)?;
         let file_name = archive
             .file_names()
-            .filter(|name| name.ends_with(".acmi") || name.ends_with(".txt"))
-            .map(|name| name.to_owned())
-            .next();
+            .filter_map(result::Result::ok)
+            .find(|name| name.ends_with(".acmi") || name.ends_with(".txt"))
+            .map(Cow::into_owned);
 
         if let Some(file_name) = file_name {
             let mut file = archive.by_name(&file_name)?;
